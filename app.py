@@ -1,12 +1,17 @@
 import streamlit as st
 import requests
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ESPN_URL = (
+ESPN_SCOREBOARD = (
     "https://site.api.espn.com/apis/site/v2/sports/soccer/"
     "fifa.world/scoreboard?limit=200&dates=20260611-20260719"
+)
+ESPN_SUMMARY = (
+    "https://site.api.espn.com/apis/site/v2/sports/soccer/"
+    "fifa.world/summary?event={}"
 )
 
 ROUND_ORDER = [
@@ -17,21 +22,38 @@ ROUND_ORDER = [
 ]
 
 # ── Algorithm ─────────────────────────────────────────────────────────────────
-def calculate_excitement(home_goals, away_goals):
-    """
-    Returns (score 0–10, components dict).
-    Weights goals and closeness; penalises blowouts only for 3+ margin.
-    """
+def calculate_excitement(home_goals, away_goals,
+                         home_sot=None, away_sot=None,
+                         home_shots=None, away_shots=None):
     margin      = abs(home_goals - away_goals)
     total_goals = home_goals + away_goals
+    has_sot     = home_sot is not None and away_sot is not None
+    has_shots   = home_shots is not None and away_shots is not None
 
     base        = 5.5
     goal_bonus  = min(total_goals * 0.45, 2.5)
     close_bonus = 0.4 if margin == 0 else (0.2 if margin == 1 else 0.0)
     margin_pen  = max(0.0, (margin - 2) * 0.55)
 
+    # SOT bonus: every SOT above 6 adds 0.1 pt, capped at 1.0
+    if has_sot:
+        total_sot = home_sot + away_sot
+        sot_bonus = round(min(max(0.0, (total_sot - 6) * 0.1), 1.0), 2)
+    else:
+        total_sot = None
+        sot_bonus = 0.0
+
+    # Domination penalty: one-sided shot share reduces score by up to 0.5
+    if has_shots:
+        total_shots = home_shots + away_shots
+        dom_ratio   = abs(home_shots - away_shots) / total_shots if total_shots else 0.0
+        dom_pen     = round(dom_ratio * 0.5, 2)
+    else:
+        total_shots = None
+        dom_pen     = 0.0
+
     score = max(0.0, min(10.0, round(
-        base + goal_bonus + close_bonus - margin_pen, 2
+        base + goal_bonus + close_bonus + sot_bonus - dom_pen - margin_pen, 2
     )))
 
     return score, {
@@ -39,8 +61,18 @@ def calculate_excitement(home_goals, away_goals):
         "goal_bonus":  round(goal_bonus,  2),
         "close_bonus": round(close_bonus, 2),
         "margin_pen":  round(margin_pen,  2),
+        "sot_bonus":   sot_bonus,
+        "dom_pen":     dom_pen,
         "total_goals": total_goals,
         "margin":      margin,
+        "total_sot":   total_sot,
+        "home_sot":    home_sot,
+        "away_sot":    away_sot,
+        "total_shots": total_shots,
+        "home_shots":  home_shots,
+        "away_shots":  away_shots,
+        "has_sot":     has_sot,
+        "has_shots":   has_shots,
     }
 
 def get_verdict(score):
@@ -53,20 +85,55 @@ def get_verdict(score):
 @st.cache_data(ttl=300)
 def fetch_all_matches():
     try:
-        r = requests.get(ESPN_URL, timeout=15)
+        r = requests.get(ESPN_SCOREBOARD, timeout=15)
         r.raise_for_status()
         return r.json().get("events", []), None
     except Exception as e:
         return None, str(e)
 
-def parse_events(events):
+def _fetch_one_summary(event_id):
+    try:
+        r = requests.get(ESPN_SUMMARY.format(event_id), timeout=15)
+        r.raise_for_status()
+        # Key stats by team displayName — home/away resolved in parse_events
+        by_team = {}
+        for team_data in r.json().get("boxscore", {}).get("teams", []):
+            name = team_data.get("team", {}).get("displayName", "")
+            if not name:
+                continue
+            team_stats = {}
+            for s in team_data.get("statistics", []):
+                stat_name = s.get("name")
+                val       = s.get("displayValue")
+                if val is None:
+                    continue
+                if stat_name == "shotsOnTarget":
+                    team_stats["sot"] = int(val)
+                elif stat_name == "totalShots":
+                    team_stats["shots"] = int(val)
+            by_team[name] = team_stats
+        return event_id, by_team
+    except Exception:
+        return event_id, {}
+
+@st.cache_data(ttl=3600)
+def fetch_match_summaries(event_ids):
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_fetch_one_summary, eid): eid for eid in event_ids}
+        for f in as_completed(futures):
+            eid, stats = f.result()
+            results[eid] = stats
+    return results
+
+def parse_events(events, summaries):
     rows = []
     components_store = {}
 
     for evt in events:
         comp        = (evt.get("competitions") or [{}])[0]
         status_type = comp.get("status", {}).get("type", {})
-        state       = status_type.get("state", "pre")   # pre | in | post
+        state       = status_type.get("state", "pre")
         competitors = comp.get("competitors", [])
 
         home = next((c for c in competitors if c.get("homeAway") == "home"), {})
@@ -75,7 +142,6 @@ def parse_events(events):
         home_goals = int(home.get("score") or 0)
         away_goals = int(away.get("score") or 0)
 
-        # Parse date
         try:
             dt = datetime.fromisoformat(evt["date"].replace("Z", "+00:00"))
             formatted_date = dt.strftime("%b %d, %H:%M")
@@ -83,7 +149,6 @@ def parse_events(events):
             dt = datetime.min.replace(tzinfo=timezone.utc)
             formatted_date = ""
 
-        # Round label from competition notes
         round_str = ""
         for note in comp.get("notes", []):
             text = note.get("headline", "")
@@ -91,7 +156,6 @@ def parse_events(events):
                 round_str = text.replace("FIFA World Cup, ", "").strip()
                 break
 
-        # Score display
         if state == "post":
             score_display = f"{home_goals} – {away_goals}"
         elif state == "in":
@@ -114,13 +178,21 @@ def parse_events(events):
         }
 
         if state == "post":
-            score, comps = calculate_excitement(home_goals, away_goals)
-            components_store[evt["id"]] = comps
-
-            row.update({
-                "Excitement": score,
-                "Verdict":    get_verdict(score),
-            })
+            mid        = evt.get("id")
+            by_team    = summaries.get(mid, {})
+            home_name  = row["Home"]
+            away_name  = row["Away"]
+            home_extra = by_team.get(home_name, {})
+            away_extra = by_team.get(away_name, {})
+            score, comps = calculate_excitement(
+                home_goals, away_goals,
+                home_sot=home_extra.get("sot"),
+                away_sot=away_extra.get("sot"),
+                home_shots=home_extra.get("shots"),
+                away_shots=away_extra.get("shots"),
+            )
+            components_store[mid] = comps
+            row.update({"Excitement": score, "Verdict": get_verdict(score)})
 
         rows.append(row)
 
@@ -140,7 +212,7 @@ st.markdown(
     "**Click any row** to see the full score breakdown."
 )
 
-# ── Load & parse ──────────────────────────────────────────────────────────────
+# ── Load fixtures ─────────────────────────────────────────────────────────────
 with st.spinner("Loading World Cup 2026 fixtures…"):
     events, err = fetch_all_matches()
 
@@ -148,7 +220,16 @@ if err or not events:
     st.error(f"Could not load fixtures: {err or 'empty response from ESPN API'}")
     st.stop()
 
-rows, components_store = parse_events(events)
+# ── Fetch shot stats for finished matches (parallel, cached 1 hr) ─────────────
+finished_ids = tuple(
+    e["id"] for e in events
+    if (e.get("competitions") or [{}])[0]
+    .get("status", {}).get("type", {}).get("state") == "post"
+)
+with st.spinner(f"Loading shot stats for {len(finished_ids)} finished games…"):
+    summaries = fetch_match_summaries(finished_ids) if finished_ids else {}
+
+rows, components_store = parse_events(events, summaries)
 df = pd.DataFrame(rows)
 
 # ── Sort: finished by Excitement desc → live → upcoming by date ───────────────
@@ -187,7 +268,7 @@ if team_search.strip():
 
 view = view.reset_index(drop=True)
 
-# ── Table + Detail panel (side by side) ──────────────────────────────────────
+# ── Table + Detail panel ──────────────────────────────────────────────────────
 DISPLAY_COLS = ["Round", "Date", "Home", "Score", "Away", "Excitement", "Verdict"]
 
 col_table, col_detail = st.columns([3, 2])
@@ -205,9 +286,11 @@ with col_table:
         height=560,
         key="match_table",
     )
+    has_shot_data = any(bool(v) for v in summaries.values())
+    stats_note = " + Shot Stats" if has_shot_data else ""
     st.caption(
         f"Showing {len(view)} of {len(df)} matches · "
-        "Data: ESPN · Refreshes every 5 min"
+        f"Data: ESPN{stats_note} · Refreshes every 5 min"
     )
 
 with col_detail:
@@ -248,12 +331,9 @@ with col_detail:
                     st.warning(f"{verdict} — Decent, but not unmissable.")
                 else:
                     st.error(f"{verdict} — One-sided or low-event. Skip the replay.")
-            else:
-                st.info("Statistics not available for this match.")
 
             if comps:
                 st.markdown("**Algorithm Score Adjustment Details:**")
-
                 m = comps["margin"]
 
                 close_label = (
@@ -270,7 +350,24 @@ with col_detail:
                 if close_label:
                     lines.append(f"- **{close_label}:** +{comps['close_bonus']:.2f} pts")
 
+                if comps["has_sot"]:
+                    lines.append(
+                        f"- **Shot Activity ({comps['total_sot']} on target · "
+                        f"{comps['home_sot']} vs {comps['away_sot']}):** +{comps['sot_bonus']:.2f} pts"
+                    )
+
                 if comps["margin_pen"] > 0:
-                    lines.append(f"- **Blowout Penalty (margin {m}):** -{comps['margin_pen']:.2f} pts")
+                    lines.append(
+                        f"- **Blowout Penalty (margin {m}):** -{comps['margin_pen']:.2f} pts"
+                    )
+
+                if comps["has_shots"] and comps["dom_pen"] > 0:
+                    lines.append(
+                        f"- **Domination Penalty ({comps['home_shots']} vs {comps['away_shots']} shots):** "
+                        f"-{comps['dom_pen']:.2f} pts"
+                    )
+
+                if not comps["has_sot"]:
+                    lines.append("- *Shot data unavailable — score based on goals only*")
 
                 st.markdown("\n".join(lines))
