@@ -220,6 +220,16 @@ st.markdown(
     "**Click any row** to see the full score breakdown."
 )
 
+# On mobile the two columns stack vertically; reverse the order so the
+# detail panel appears above the table instead of below it.
+st.markdown("""
+<style>
+@media (max-width: 640px) {
+    [data-testid="stHorizontalBlock"] { flex-direction: column-reverse; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── Load fixtures ─────────────────────────────────────────────────────────────
 with st.spinner("Loading World Cup 2026 fixtures…"):
     events, err = fetch_all_matches()
