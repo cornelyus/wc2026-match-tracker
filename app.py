@@ -149,12 +149,20 @@ def parse_events(events, summaries):
             dt = datetime.min.replace(tzinfo=timezone.utc)
             formatted_date = ""
 
-        round_str = ""
-        for note in comp.get("notes", []):
-            text = note.get("headline", "")
-            if text:
-                round_str = text.replace("FIFA World Cup, ", "").strip()
-                break
+        alt_note    = comp.get("altGameNote", "") or ""
+        season_slug = evt.get("season", {}).get("slug", "")
+        if alt_note:
+            round_str = alt_note.replace("FIFA World Cup, ", "").strip()
+        else:
+            round_str = {
+                "round-of-32":    "Round of 32",
+                "round-of-16":    "Round of 16",
+                "quarterfinals":  "Quarterfinals",
+                "semifinals":     "Semifinals",
+                "3rd-place-match":"3rd Place Final",
+                "final":          "Final",
+            }.get(season_slug, "")
+        round_str = round_str.replace("3rd-Place Match", "3rd Place Final")
 
         if state == "post":
             score_display = f"{home_goals} – {away_goals}"
