@@ -61,10 +61,7 @@ def get_verdict(score):
 
 # ── API ───────────────────────────────────────────────────────────────────────
 def _headers(api_key):
-    return {
-        "x-rapidapi-host": "v3.football.api-sports.io",
-        "x-rapidapi-key":  api_key,
-    }
+    return {"x-apisports-key": api_key}
 
 @st.cache_data(ttl=300)
 def fetch_fixtures(api_key):
