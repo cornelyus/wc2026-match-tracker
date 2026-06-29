@@ -74,22 +74,30 @@ Shot activity reveals match intensity that goals don't capture. Six SOT is a low
 **Blowout penalty: `max(0.0, (margin - 2) × 0.55)`**
 A 4-0 kills suspense even if it has 4 goals. Margin above 2 is penalised progressively — 3-0 costs 0.55, 4-0 costs 1.10, etc.
 
-**Domination penalty: `dom_ratio × 0.5`**
-If one team takes 80% of total shots, the other team barely existed. `dom_ratio = abs(home_shots − away_shots) / total_shots`. At 80/20 split the penalty is 0.3; at 90/10 it's 0.4.
+**Shot-volume bonus: `min(max(0.0, (total_shots − 20) × 0.04), 0.8)`** *(added — see D10)*
+A chance-heavy game is open and entertaining even when finishing is poor. Total shots above a ~20 baseline add 0.04 each, capped at 0.8 (full bonus at 40 shots). This is the only thing that lifts a high-shot 0–0 out of "skip".
+
+**Drama bonus** *(added — see D9)*
+Reads the goal *sequence* (lead changes, equalizers, meaningful late goals), the one thing the final scoreline can't show.
+
+**Domination penalty: `max(0.0, dom_ratio − 0.4) × 0.83`** *(deadbanded — see D10)*
+Only genuinely one-sided games are punished. `dom_ratio = abs(home_shots − away_shots) / total_shots`. Zero penalty until worse than ~70/30; ~0.17 at 80/20; ~0.50 at a total wipeout. A competitive 60/40 game is no longer dinged.
 
 ### Worked example
 
-Argentina 2–1 France: 3 goals, 1-goal margin, 14 SOT (8 vs 6), 24 total shots (14 vs 10).
+Argentina 2–1 France: 3 goals, 1-goal margin, 14 SOT (8 vs 6), 24 total shots (14 vs 10), no lead changes/late drama.
 
 ```
 base        =  5.50
 goal_bonus  = +1.35  (3 × 0.45)
 close_bonus = +0.20  (1-goal margin)
 sot_bonus   = +0.80  ((14 − 6) × 0.1)
-dom_pen     = −0.08  (abs(14−10)/24 × 0.5)
+volume_bonus= +0.16  ((24 − 20) × 0.04)
+drama_bonus = +0.00  (no lead changes / equalizers / late goals)
+dom_pen     =  0.00  (ratio 0.17 < 0.4 deadband)
 margin_pen  =  0.00  (margin ≤ 2)
 ─────────────────────
-score       =  7.77  → ⚡ Exciting
+score       =  8.01  → 🔥 Classic
 ```
 
 ---
@@ -212,3 +220,79 @@ st.markdown("""
 **Why:** All ESPN endpoints are public and unauthenticated. The app can be forked and deployed to Streamlit Cloud by anyone with no setup beyond linking the repo.
 
 `.streamlit/secrets.toml` is gitignored as a precaution — it's the standard location for Streamlit secrets and could accidentally be committed if created locally for future use (e.g. a GitHub Gist URL for MVP2 enriched stats). The file doesn't need to exist for the app to run.
+
+---
+
+## D9 — Drama Index from `keyEvents` (goal-timing bonus)
+
+**Decision:** Add a `drama_bonus` to `calculate_excitement()` derived from the *sequence* of goals, not just the final scoreline.
+
+**Why:** Every other component (goals, margin, shots) reads only the end state. Two 6-goal games can be wildly different experiences — Algeria 3–3 Austria (three equalizers, a 90'+3' go-ahead, a 90'+6' leveller) vs Netherlands 5–1 Sweden (4–0 by half-time). The scoreline-based formula rated them almost identically; the goal timeline is the missing signal.
+
+**Where the data comes from:** The `keyEvents` array is already in the `/summary` response the app fetches for shot stats — so this costs **zero extra HTTP requests**. `_parse_drama()` walks the scoring plays (skipping `shootout` events), reconstructs the running home/away score from each goal's text (`"Goal! Algeria 3 - 3 Austria."`, home listed first), and counts three things:
+
+- **lead_changes** — the lead changed hands (tracked via the last non-zero lead sign, so it counts an actual swing from one team leading to the other, not the intermediate equalizer)
+- **equalizers** — a trailing team drew level
+- **late_goals** — goals at minute ≥ 80 (clock's leading integer, incl. stoppage) **that arrived while the game was still within one goal**. `_parse_drama()` tracks the running score and only counts a late goal if the margin *before* it was ≤ 1 — a late winner/leveller/insurance, not a consolation piled onto a decided blowout.
+
+**Formula:**
+```python
+drama_bonus = min(lead_changes * 0.4 + equalizers * 0.3 + late_goals * 0.2, 1.2)
+```
+
+**Weight rationale** — ordered by rarity × dramatic punch, intuition-calibrated (not data-fit — too little data), scaled so a genuine thriller saturates the cap:
+- **lead_changes (0.4, highest):** rarest, strongest. A lead can't flip on a single goal (score must pass through level first), so it guarantees a real back-and-forth swing.
+- **equalizers (0.3):** comeback tension; trailing team draws level. Common in tight games, less decisive than an actual swing.
+- **late_goals (0.2, lowest):** drama near the whistle, the weakest/noisiest signal — so it's filtered to *meaningful* late goals only (see above); a late goal in a decided 5–1 is piling on, not drama.
+
+**Worked examples (live WC2026 data):**
+
+```
+Algeria 3–3 Austria    (lc 1, eq 3, late 2): 0.4 + 0.9 + 0.4 = 1.7 → cap +1.20 → raw 9.88, eased to 9.59 🔥 (D11)
+Netherlands 5–1 Sweden (lc 0, eq 0, late 0): the 89' goal came at 4–1, excluded → +0.00
+```
+
+The cap (1.2) keeps a single thriller from saturating the scale; a 0–0 has no goal events, so its drama bonus is always 0. The metric is purely additive (a bonus, never a penalty) and lifts back-and-forth games above flat ones at the same scoreline without moving one-sided or goalless matches.
+
+---
+
+## D10 — Shot-volume bonus + domination-penalty deadband
+
+**Decision:** Add a `volume_bonus` for total shots, and deadband the existing `dom_pen` so it only fires on genuinely one-sided games.
+
+**Why (the problem case):** Colombia 0–0 Portugal — 37 total shots (24 vs 13), 8 on target — scored **5.95 "Skip"**, the same neighbourhood as a quiet 0–0. Two flaws combined:
+
+1. **Shot volume was invisible.** Only shots *on target above 6* scored; the 37-shot chance-fest and a dull 0–0 got the same shot credit. And the drama bonus can't help a goalless game (no goals to sequence) — a volume term is the *only* lever that lifts a high-shot 0–0.
+2. **The domination penalty over-fired.** `dom_pen = dom_ratio × 0.5` rose linearly from *zero* imbalance, so Colombia's competitive 65/35 split was penalised −0.15 — and the heavier-shooting side got dinged hardest. The intent ("one team barely existed") only holds at extreme splits.
+
+**Changes:**
+```python
+volume_bonus = min(max(0.0, (total_shots - 20) * 0.04), 0.8)   # +0.04/shot >20, cap 0.8
+dom_pen      = max(0.0, dom_ratio - 0.4) * 0.83                 # 0 until ~70/30, ~0.5 at wipeout
+```
+
+**Effect:** Colombia 0–0 Portugal → **6.78 ⚖️ Decent** (+0.68 volume, dom now 0). The deadband leaves only true blowouts penalised — Canada 6–0 Qatar (32 vs 2 shots, −0.40), England 0–0 Ghana (19 vs 2, −0.34), Spain 4–0 Saudi Arabia (22 vs 3). The two new shot terms also self-balance in lopsided high-volume games (e.g. NZ 1–5 Belgium, 41 shots but 6 vs 35: +0.80 volume partly offset by −0.26 domination).
+
+**Tradeoff:** raw shot count can flatter long-range pot-shots — the on-target (`sot_bonus`) term keeps quality in the mix, and the +0.8 cap limits the damage. Adding a positive component also pushed the best games into the old 10.00 hard clamp; that's now handled by the soft cap (see D11) rather than by trimming volume.
+
+---
+
+## D11 — Soft cap on the score ceiling
+
+**Decision:** Replace the hard `min(10.0, …)` clamp with `_soft_cap()` — scores above a 9.0 knee are eased asymptotically toward 10 instead of being clipped.
+
+**Why:** Once drama + volume stacked on top of goal/shot bonuses, the realistic maximum sum exceeded 11, so the best games piled up at exactly 10.00 — England 4–2 Croatia and Morocco 4–2 Haiti both pinned there, indistinguishable. They're thrillers, but 10 should stay reserved for a hypothetical perfect storm, not be reachable by any very good game.
+
+**How:**
+```python
+def _soft_cap(raw, knee=9.0, ceiling=10.0):
+    if raw <= knee:
+        return raw                       # most games: score == the literal sum
+    span = ceiling - knee
+    return knee + span * (1 - math.exp(-(raw - knee) / span))
+```
+The curve is continuous at the knee (derivative 1, so no kink) and monotonic (ordering preserved), and approaches 10 without reaching it — raw 10.3 → ~9.7, raw 12 → ~9.99. Only the handful of games scoring 9.0+ are touched; everything below is unchanged, so the breakdown still sums to the score for the vast majority. When the cap is active the detail panel adds a line (`Raw total X eased toward the 10 ceiling → Y`) so the non-additivity is explicit.
+
+**Effect:** no game now sits at 10.00 — current top is Morocco 4–2 Haiti at **9.73**, with England 4–2 Croatia 9.72 and Algeria 3–3 Austria 9.59 cleanly separated instead of tied at the ceiling.
+
+The knee (9.0) is the single knob: raise it to compress fewer games, lower it for more headroom among elite games.

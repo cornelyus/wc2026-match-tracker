@@ -1,3 +1,5 @@
+import re
+import math
 import streamlit as st
 import requests
 import pandas as pd
@@ -22,9 +24,23 @@ ROUND_ORDER = [
 ]
 
 # ── Algorithm ─────────────────────────────────────────────────────────────────
+def _soft_cap(raw, knee=9.0, ceiling=10.0):
+    """Ease scores above the knee asymptotically toward the ceiling.
+
+    Below the knee the raw additive total is returned unchanged (so the breakdown
+    still sums to the score for the vast majority of games). Above it, excess is
+    compressed so even a perfect storm of bonuses only approaches 10 — the ceiling
+    stays reserved and elite games keep their ordering instead of all pinning at 10.
+    """
+    if raw <= knee:
+        return raw
+    span = ceiling - knee
+    return knee + span * (1 - math.exp(-(raw - knee) / span))
+
 def calculate_excitement(home_goals, away_goals,
                          home_sot=None, away_sot=None,
-                         home_shots=None, away_shots=None):
+                         home_shots=None, away_shots=None,
+                         lead_changes=0, equalizers=0, late_goals=0):
     margin      = abs(home_goals - away_goals)
     total_goals = home_goals + away_goals
     has_sot     = home_sot is not None and away_sot is not None
@@ -35,6 +51,13 @@ def calculate_excitement(home_goals, away_goals,
     close_bonus = 0.4 if margin == 0 else (0.2 if margin == 1 else 0.0)
     margin_pen  = max(0.0, (margin - 2) * 0.55)
 
+    # Drama bonus: rewards how the goals arrived, not just the final scoreline.
+    # Lead changes and comeback equalizers and late goals capture the story a
+    # static scoreline misses (a swingy 3-3 vs a 5-1 that was over by half-time).
+    drama_bonus = round(min(
+        lead_changes * 0.4 + equalizers * 0.3 + late_goals * 0.2, 1.2
+    ), 2)
+
     # SOT bonus: every SOT above 6 adds 0.1 pt, capped at 1.0
     if has_sot:
         total_sot = home_sot + away_sot
@@ -43,26 +66,38 @@ def calculate_excitement(home_goals, away_goals,
         total_sot = None
         sot_bonus = 0.0
 
-    # Domination penalty: one-sided shot share reduces score by up to 0.5
+    # Shot-volume bonus: a chance-heavy game is open and entertaining even when
+    # finishing is poor (a 37-shot 0-0 isn't the same as a quiet one). Total shots
+    # above a ~20 baseline add 0.04 each, capped at 0.8.
     if has_shots:
-        total_shots = home_shots + away_shots
-        dom_ratio   = abs(home_shots - away_shots) / total_shots if total_shots else 0.0
-        dom_pen     = round(dom_ratio * 0.5, 2)
+        total_shots  = home_shots + away_shots
+        volume_bonus = round(min(max(0.0, (total_shots - 20) * 0.04), 0.8), 2)
+        # Domination penalty: only genuinely one-sided games (worse than ~70/30)
+        # are punished — a deadband so competitive 60/40 games aren't dinged.
+        dom_ratio = abs(home_shots - away_shots) / total_shots if total_shots else 0.0
+        dom_pen   = round(max(0.0, dom_ratio - 0.4) * 0.83, 2)
     else:
-        total_shots = None
-        dom_pen     = 0.0
+        total_shots  = None
+        volume_bonus = 0.0
+        dom_pen      = 0.0
 
-    score = max(0.0, min(10.0, round(
-        base + goal_bonus + close_bonus + sot_bonus - dom_pen - margin_pen, 2
-    )))
+    raw = (base + goal_bonus + close_bonus + sot_bonus + drama_bonus + volume_bonus
+           - dom_pen - margin_pen)
+    score = round(_soft_cap(max(0.0, raw)), 2)
 
     return score, {
+        "raw_score":   round(raw, 2),
         "base":        base,
         "goal_bonus":  round(goal_bonus,  2),
         "close_bonus": round(close_bonus, 2),
         "margin_pen":  round(margin_pen,  2),
-        "sot_bonus":   sot_bonus,
-        "dom_pen":     dom_pen,
+        "sot_bonus":    sot_bonus,
+        "dom_pen":      dom_pen,
+        "volume_bonus": volume_bonus,
+        "drama_bonus":  drama_bonus,
+        "lead_changes": lead_changes,
+        "equalizers":   equalizers,
+        "late_goals":   late_goals,
         "total_goals": total_goals,
         "margin":      margin,
         "total_sot":   total_sot,
@@ -91,13 +126,59 @@ def fetch_all_matches():
     except Exception as e:
         return None, str(e)
 
+def _parse_drama(key_events):
+    """Reconstruct the goal sequence from keyEvents into a 'drama' signal.
+
+    Reads the running score embedded in each goal's text ("Goal! Algeria 3 - 3
+    Austria.", home listed first) to count lead changes (the lead changed hands)
+    and equalizers (a trailing team drew level), plus late goals (minute >= 80).
+    A late goal only counts if the game was still within one goal when it arrived
+    (a winner/leveller/insurance), not a consolation piled onto a decided blowout.
+    Shootout events are ignored — penalties aren't open-play drama.
+    """
+    lead_changes = equalizers = late_goals = 0
+    prev = None             # last non-zero lead sign (+1 home ahead, -1 away ahead)
+    prev_h = prev_a = 0     # running score *before* the current goal
+    for e in key_events:
+        if not e.get("scoringPlay") or e.get("shootout"):
+            continue
+        m = re.search(r"(\d+)\s*,\s*\D*?(\d+)\s*\.", e.get("text", "") or "")
+        if not m:
+            continue
+        h, a = int(m.group(1)), int(m.group(2))
+        diff = h - a
+        sign = (diff > 0) - (diff < 0)
+        if prev is not None:
+            if sign == 0 and prev != 0:
+                equalizers += 1
+            elif sign != 0 and prev != 0 and sign != prev:
+                lead_changes += 1
+        if sign != 0:
+            prev = sign
+        elif prev is None:
+            prev = 0
+
+        clock = (e.get("clock") or {}).get("displayValue", "") or ""
+        mm = re.match(r"\s*(\d+)", clock)
+        if mm and int(mm.group(1)) >= 80 and abs(prev_h - prev_a) <= 1:
+            late_goals += 1
+
+        prev_h, prev_a = h, a
+
+    return {
+        "lead_changes": lead_changes,
+        "equalizers":   equalizers,
+        "late_goals":   late_goals,
+    }
+
 def _fetch_one_summary(event_id):
     try:
         r = requests.get(ESPN_SUMMARY.format(event_id), timeout=15)
         r.raise_for_status()
+        payload = r.json()
         # Key stats by team displayName — home/away resolved in parse_events
         by_team = {}
-        for team_data in r.json().get("boxscore", {}).get("teams", []):
+        for team_data in payload.get("boxscore", {}).get("teams", []):
             name = team_data.get("team", {}).get("displayName", "")
             if not name:
                 continue
@@ -112,9 +193,10 @@ def _fetch_one_summary(event_id):
                 elif stat_name == "totalShots":
                     team_stats["shots"] = int(val)
             by_team[name] = team_stats
-        return event_id, by_team
+        drama = _parse_drama(payload.get("keyEvents", []))
+        return event_id, {"teams": by_team, "drama": drama}
     except Exception:
-        return event_id, {}
+        return event_id, {"teams": {}, "drama": {}}
 
 @st.cache_data(ttl=3600)
 def fetch_match_summaries(event_ids):
@@ -187,7 +269,9 @@ def parse_events(events, summaries):
 
         if state == "post":
             mid        = evt.get("id")
-            by_team    = summaries.get(mid, {})
+            entry      = summaries.get(mid, {})
+            by_team    = entry.get("teams", {})
+            drama      = entry.get("drama", {})
             home_name  = row["Home"]
             away_name  = row["Away"]
             home_extra = by_team.get(home_name, {})
@@ -198,6 +282,9 @@ def parse_events(events, summaries):
                 away_sot=away_extra.get("sot"),
                 home_shots=home_extra.get("shots"),
                 away_shots=away_extra.get("shots"),
+                lead_changes=drama.get("lead_changes", 0),
+                equalizers=drama.get("equalizers", 0),
+                late_goals=drama.get("late_goals", 0),
             )
             components_store[mid] = comps
             row.update({"Excitement": score, "Verdict": get_verdict(score)})
@@ -374,6 +461,27 @@ with col_detail:
                         f"{comps['home_sot']} vs {comps['away_sot']}):** +{comps['sot_bonus']:.2f} pts"
                     )
 
+                if comps.get("volume_bonus", 0) > 0:
+                    lines.append(
+                        f"- **Shot Volume ({comps['total_shots']} total shots · "
+                        f"{comps['home_shots']} vs {comps['away_shots']}):** +{comps['volume_bonus']:.2f} pts"
+                    )
+
+                if comps.get("drama_bonus", 0) > 0:
+                    parts = []
+                    if comps["lead_changes"]:
+                        parts.append(f"{comps['lead_changes']} lead change"
+                                     f"{'s' if comps['lead_changes'] != 1 else ''}")
+                    if comps["equalizers"]:
+                        parts.append(f"{comps['equalizers']} equalizer"
+                                     f"{'s' if comps['equalizers'] != 1 else ''}")
+                    if comps["late_goals"]:
+                        parts.append(f"{comps['late_goals']} late goal"
+                                     f"{'s' if comps['late_goals'] != 1 else ''}")
+                    lines.append(
+                        f"- **Drama ({' · '.join(parts)}):** +{comps['drama_bonus']:.2f} pts"
+                    )
+
                 if comps["margin_pen"] > 0:
                     lines.append(
                         f"- **Blowout Penalty (margin {m}):** -{comps['margin_pen']:.2f} pts"
@@ -387,5 +495,11 @@ with col_detail:
 
                 if not comps["has_sot"]:
                     lines.append("- *Shot data unavailable — score based on goals only*")
+
+                if score is not None and comps.get("raw_score", 0) - score > 0.01:
+                    lines.append(
+                        f"- *Raw total {comps['raw_score']:.2f} eased toward the 10 ceiling "
+                        f"→ {score:.2f}*"
+                    )
 
                 st.markdown("\n".join(lines))
