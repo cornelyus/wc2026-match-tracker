@@ -47,7 +47,7 @@ def calculate_excitement(home_goals, away_goals,
     has_sot     = home_sot is not None and away_sot is not None
     has_shots   = home_shots is not None and away_shots is not None
 
-    base        = 5.5
+    base        = 4.5
     goal_bonus  = min(total_goals * 0.45, 2.5)
     close_bonus = 0.4 if margin == 0 else (0.2 if margin == 1 else 0.0)
     margin_pen  = max(0.0, (margin - 2) * 0.55)
@@ -140,13 +140,13 @@ def _parse_drama(key_events):
     Reads the running score embedded in each goal's text ("Goal! Algeria 3 - 3
     Austria.", home listed first) to count lead changes (the lead changed hands)
     and equalizers (a trailing team drew level), plus late goals (minute >= 80).
-    A late goal only counts if the game was still within one goal when it arrived
-    (a winner/leveller/insurance), not a consolation piled onto a decided blowout.
-    Shootout events are ignored — penalties aren't open-play drama.
+    A late goal only counts if it leaves the game within one goal AFTERWARDS — a
+    late winner, leveller, or a strike that pulls it back to a one-score game — but
+    NOT a lead-extender like 1-0 -> 2-0 that kills the contest, nor a consolation
+    piled onto a decided blowout. Shootout events are ignored — not open-play drama.
     """
     lead_changes = equalizers = late_goals = 0
     prev = None             # last non-zero lead sign (+1 home ahead, -1 away ahead)
-    prev_h = prev_a = 0     # running score *before* the current goal
     for e in key_events:
         if not e.get("scoringPlay") or e.get("shootout"):
             continue
@@ -168,10 +168,10 @@ def _parse_drama(key_events):
 
         clock = (e.get("clock") or {}).get("displayValue", "") or ""
         mm = re.match(r"\s*(\d+)", clock)
-        if mm and int(mm.group(1)) >= 80 and abs(prev_h - prev_a) <= 1:
+        # margin AFTER the goal: a late goal is only "drama" if it leaves the game
+        # within one (winner/leveller/comeback), not if it stretches a lead.
+        if mm and int(mm.group(1)) >= 80 and abs(h - a) <= 1:
             late_goals += 1
-
-        prev_h, prev_a = h, a
 
     return {
         "lead_changes": lead_changes,

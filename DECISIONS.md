@@ -59,8 +59,8 @@ home_extra = by_team.get(home_name, {})
 
 ### Components
 
-**Base: 5.5**
-A neutral midpoint. A match where nothing interesting happened isn't 0 — it happened, teams showed up. 5.5 keeps the scale meaningful at both ends.
+**Base: 4.5** *(re-anchored from 5.5 — see D13)*
+A calibration constant, **not** a metaphysical midpoint. It was originally 5.5 ("a match that happened isn't a 0; deviate up and down from the middle"), which assumed the bonuses and penalties roughly cancel for an average game. They don't — five bonuses only ever *add* while the penalties only fire on a minority of games, so the typical match nets ~+1.9 and the realized median drifted to 7.4 with a third of all games rated "Classic". Lowering the base to 4.5 re-centers the realized distribution so the median match is a modest "Decent" (~6.4) and "Classic" is rare again. See D13 for the full reasoning.
 
 **Goal bonus: `min(total_goals × 0.45, 2.5)`**
 Goals are the primary excitement driver. The cap at 2.5 prevents a 7-goal game from crowding out everything else.
@@ -91,7 +91,7 @@ Only genuinely one-sided games are punished. `dom_ratio = abs(home_shots − awa
 Argentina 2–1 France: 3 goals, 1-goal margin, 14 SOT (8 vs 6), 24 total shots (14 vs 10), no lead changes/late drama.
 
 ```
-base        =  5.50
+base        =  4.50
 goal_bonus  = +1.35  (3 × 0.45)
 close_bonus = +0.20  (1-goal margin)
 sot_bonus   = +0.80  ((14 − 6) × 0.1)
@@ -100,7 +100,7 @@ drama_bonus = +0.00  (no lead changes / equalizers / late goals)
 dom_pen     =  0.00  (ratio 0.17 < 0.4 deadband)
 margin_pen  =  0.00  (margin ≤ 2)
 ─────────────────────
-score       =  8.01  → 🔥 Classic
+score       =  7.01  → ⚡ Exciting
 ```
 
 ---
@@ -236,7 +236,7 @@ st.markdown("""
 
 - **lead_changes** — the lead changed hands (tracked via the last non-zero lead sign, so it counts an actual swing from one team leading to the other, not the intermediate equalizer)
 - **equalizers** — a trailing team drew level
-- **late_goals** — goals at minute ≥ 80 (clock's leading integer, incl. stoppage) **that arrived while the game was still within one goal**. `_parse_drama()` tracks the running score and only counts a late goal if the margin *before* it was ≤ 1 — a late winner/leveller/insurance, not a consolation piled onto a decided blowout.
+- **late_goals** — goals at minute ≥ 80 (clock's leading integer, incl. stoppage) **that leave the game within one goal afterwards**. The guard checks the margin *after* the goal (`abs(h − a) ≤ 1`), not before — see D13 for why. This counts a late winner breaking a deadlock (0–0 → 1–0), a go-ahead in a tied game (1–1 → 2–1), or a comeback strike that pulls it back to one (3–1 → 3–2); it excludes a lead-*extender* (1–0 → 2–0) that kills the contest, and a consolation on a blowout (4–0 → 4–1).
 
 **Formula:**
 ```python
@@ -318,3 +318,29 @@ Reusing the existing **6-SOT baseline** means no new magic number — SOT is now
 **Effect:** Portugal 1–1 Congo → **6.65 ⚖️ Decent**, now correctly *below* Colombia 0–0 Portugal (6.78, unchanged — it's above the baseline so untouched). The penalty is surgical: only the ~16 games under 6 SOT move, all downward. Three grind-out 1–0s with 2–3 SOT drop from Decent to Skip (Scotland 0–1 Morocco, Uruguay 0–1 Spain, Panama 0–1 Croatia) — genuinely low-event games that shouldn't read as "Decent." Detail panel shows a `Low Shot Activity Penalty` line when it fires.
 
 **Tradeoff:** a clinically efficient win (few shots, decisive finishing) is dinged the same as a dull one — e.g. Congo DR 3–1 Uzbekistan (5 SOT) loses 0.15. The penalty is gentle in that band (≤0.45 until 2 SOT), and a strong scoreline still carries the game; the slope (0.15) and floor (0.6) are the knobs if that proves too harsh.
+
+---
+
+## D13 — Re-anchoring the base (5.5 → 4.5) + late-goal redefinition
+
+**Decision:** Lower the base from 5.5 to **4.5**, and redefine a "late goal" by the margin *after* it rather than before.
+
+**Why (the diagnosis):** Running the live formula across all 76 finished games exposed an upside-down distribution — **33% Classic, 28% Exciting, 32% Decent, 8% Skip**, median **7.40**, and nothing scoring below 5.30. "Classic" (meant to be the rarest tier) was the *largest*, and the entire bottom half of the 0–10 scale was dead.
+
+**Root cause:** 5.5 was chosen as a "neutral midpoint" (old D3) on the assumption that bonuses and penalties roughly cancel for an average match. They don't. Five components only ever *add* (goal, close, SOT, volume, drama — up to +5.9 combined), while the penalties only fire on a minority of games (blowouts, lopsided shots, sub-6-SOT). So the typical competitive match nets **~+1.9** with no offsetting penalty, and 5.5 + 1.9 ≈ the 7.4 realized median. In effect 5.5 anchored the *zero-bonus game* — a goalless, near-shotless, one-sided non-event — to the middle of the scale, so every real match floated above it. This was **calibration drift**: each one-directional bonus we added (volume in D10, drama in D9) ratcheted the mean up without re-checking the anchor.
+
+**The fix:** the base is a calibration constant, so set it to whatever makes the *realized* distribution sane. A sweep across the live data:
+
+| base | Classic | Exciting | Decent | Skip | median |
+|---|---|---|---|---|---|
+| 5.5 | 33% | 28% | 32% | 8% | 7.40 |
+| **4.5** | **12%** | **12%** | **37%** | **39%** | **6.40** |
+| 4.0 | 7% | 7% | 34% | 53% | 5.90 |
+
+4.5 lands the median match at a modest **Decent (~6.4)** and makes Classic rare (~9 games), a right-side-up pyramid. We picked 4.5 rather than lower (which would truly center the scale at ~5.0) because the verdict thresholds put **Skip below 6.0** — anchoring the *average* match at dead-centre would label it "skip the replay," which is too harsh. 4.5 is the base at which the base and the thresholds agree. Bonus: it demotes blowouts for free — Germany 7–1 Curaçao falls 7.35 → ~6.35 (Decent) with no change to the domination penalty.
+
+*(The principled alternative — making every component a signed deviation around its own typical value, the way D12 did for SOT, so the adjustments average to ~0 and 5.5 keeps its literal meaning — was considered and deferred as more invasive. The base change achieves the same re-centering with one number.)*
+
+**Late-goal redefinition (a correctness fix bundled in):** the drama bonus counted a late goal if the margin *before* it was ≤ 1, which wrongly rewarded a **lead-extender** — e.g. Switzerland 4–1 Bosnia got +0.2 for a **2–0 at 84'** (it was 1–0 before), an insurance goal that *killed* the game. The guard now checks the margin **after** (`abs(h − a) ≤ 1`): it counts late winners/levellers/comebacks-to-within-one and excludes lead-extenders and blowout consolations. Net effect on the live set: 11 games shed a phantom bonus (Switzerland 4–1 among them), and 1 correctly *gains* one (Norway 3–2 Senegal — a late goal that pulled it back to within one, which the old rule missed). See D9 for the component details.
+
+**Effect:** distribution becomes **Classic 9 (12%) · Exciting 9 (12%) · Decent 28 (37%) · Skip 30 (40%)**, median 6.40, range 4.30–9.11 — a tracker that actually discriminates. The base (4.5) and the verdict thresholds (D3) are now the joint knobs for distribution shape.
