@@ -1,6 +1,7 @@
 import re
 import math
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -311,6 +312,35 @@ st.set_page_config(
     page_icon="🏆",
     layout="wide",
 )
+
+# ── Analytics (self-hosted Umami) ─────────────────────────────────────────────
+# Inject the Umami tracker into the *parent* document — components.html() renders
+# in a sandboxed iframe, so a naive tag would track the iframe, not the real app
+# URL. The id-guard keeps Streamlit's per-interaction reruns from re-injecting it.
+# Configure via secrets (Community Cloud → app settings → Secrets); no-op if unset.
+try:
+    _UMAMI_SRC = st.secrets.get("UMAMI_SRC", "")
+    _UMAMI_ID  = st.secrets.get("UMAMI_ID", "")
+except Exception:
+    _UMAMI_SRC = _UMAMI_ID = ""
+
+if _UMAMI_SRC and _UMAMI_ID:
+    components.html(
+        f"""
+        <script>
+          const doc = window.parent.document;
+          if (!doc.getElementById("umami-tracker")) {{
+            const s = doc.createElement("script");
+            s.id = "umami-tracker";
+            s.defer = true;
+            s.src = "{_UMAMI_SRC}";
+            s.setAttribute("data-website-id", "{_UMAMI_ID}");
+            doc.head.appendChild(s);
+          }}
+        </script>
+        """,
+        height=0,
+    )
 
 st.title("🏆 World Cup 2026 — Match Excitement Tracker")
 st.markdown(
