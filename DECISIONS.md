@@ -71,6 +71,9 @@ A tense finish adds excitement independent of goal count. A 0-0 after 90 minutes
 **SOT bonus: `min(max(0.0, (total_sot - 6) × 0.1), 1.0)`**
 Shot activity reveals match intensity that goals don't capture. Six SOT is a low-baseline "normal" game; every additional SOT adds 0.1 pt, capped at 1.0 (so 16 SOT gives the full bonus).
 
+**Low-SOT penalty: `min(max(0.0, (6 − total_sot) × 0.15), 0.6)`** *(added — see D12)*
+The mirror image of the SOT bonus around the same 6-SOT baseline: below 6, each missing SOT subtracts 0.15 (capped −0.6), so a few-chances grind isn't rated like an open game.
+
 **Blowout penalty: `max(0.0, (margin - 2) × 0.55)`**
 A 4-0 kills suspense even if it has 4 goals. Margin above 2 is penalised progressively — 3-0 costs 0.55, 4-0 costs 1.10, etc.
 
@@ -296,3 +299,22 @@ The curve is continuous at the knee (derivative 1, so no kink) and monotonic (or
 **Effect:** no game now sits at 10.00 — current top is Morocco 4–2 Haiti at **9.73**, with England 4–2 Croatia 9.72 and Algeria 3–3 Austria 9.59 cleanly separated instead of tied at the ceiling.
 
 The knee (9.0) is the single knob: raise it to compress fewer games, lower it for more headroom among elite games.
+
+---
+
+## D12 — Low-SOT penalty (symmetric shot-activity signal)
+
+**Decision:** Subtract a `low_sot_pen` when a finished game has *fewer* than 6 shots on target — `min((6 - total_sot) × 0.15, 0.6)` — turning SOT from a one-sided bonus into a continuous signal centered on a 6-SOT "average" game.
+
+**Why (the problem case):** Portugal 1–1 Congo DR — only **3 SOT all match** — scored **7.10 ⚡ Exciting**, *above* Colombia 0–0 Portugal (8 SOT, 37 total shots) at 6.78. The 1–1 won purely on 2 goals (+0.90) plus a comeback equalizer (+0.30), while the formula was completely **deaf below 6 SOT**: `sot_bonus` only ever *added*, starting at 6, so a 3-SOT non-event and a 6-SOT game got the same (zero) shot credit. Trying to fix the ranking by inflating the busy game didn't work — 8 SOT is mid-pack (the field runs to 18), and the 0–0's distinctive volume term is already near its 0.8 cap. The clean lever is to **penalize the dull game**, not inflate the busy one.
+
+**Change:**
+```python
+sot_bonus   = min(max(0.0, (total_sot - 6) * 0.1),  1.0)   # above 6: +0.10/SOT, cap +1.0
+low_sot_pen = min(max(0.0, (6 - total_sot) * 0.15), 0.6)   # below 6: -0.15/SOT, cap -0.6
+```
+Reusing the existing **6-SOT baseline** means no new magic number — SOT is now one signed gauge: above-average attacking adds, below-average subtracts. The −0.6 floor binds at 0–2 total SOT, so a near-shotless game can't crater the score.
+
+**Effect:** Portugal 1–1 Congo → **6.65 ⚖️ Decent**, now correctly *below* Colombia 0–0 Portugal (6.78, unchanged — it's above the baseline so untouched). The penalty is surgical: only the ~16 games under 6 SOT move, all downward. Three grind-out 1–0s with 2–3 SOT drop from Decent to Skip (Scotland 0–1 Morocco, Uruguay 0–1 Spain, Panama 0–1 Croatia) — genuinely low-event games that shouldn't read as "Decent." Detail panel shows a `Low Shot Activity Penalty` line when it fires.
+
+**Tradeoff:** a clinically efficient win (few shots, decisive finishing) is dinged the same as a dull one — e.g. Congo DR 3–1 Uzbekistan (5 SOT) loses 0.15. The penalty is gentle in that band (≤0.45 until 2 SOT), and a strong scoreline still carries the game; the slope (0.15) and floor (0.6) are the knobs if that proves too harsh.

@@ -58,13 +58,19 @@ def calculate_excitement(home_goals, away_goals,
         lead_changes * 0.4 + equalizers * 0.3 + late_goals * 0.2, 1.2
     ), 2)
 
-    # SOT bonus: every SOT above 6 adds 0.1 pt, capped at 1.0
+    # SOT signal: a continuous gauge centered on a 6-SOT "average" game. Above 6,
+    # each extra SOT adds 0.1 pt (capped +1.0); below 6, each missing SOT subtracts
+    # 0.15 pt (capped -0.6) so a goalless grind or a few-chances win isn't rated
+    # like an open game. Penalizing the dull game is cleaner than inflating the busy
+    # one — a 3-SOT 1-1 should rank below an 8-SOT 0-0.
     if has_sot:
-        total_sot = home_sot + away_sot
-        sot_bonus = round(min(max(0.0, (total_sot - 6) * 0.1), 1.0), 2)
+        total_sot   = home_sot + away_sot
+        sot_bonus   = round(min(max(0.0, (total_sot - 6) * 0.1), 1.0), 2)
+        low_sot_pen = round(min(max(0.0, (6 - total_sot) * 0.15), 0.6), 2)
     else:
-        total_sot = None
-        sot_bonus = 0.0
+        total_sot   = None
+        sot_bonus   = 0.0
+        low_sot_pen = 0.0
 
     # Shot-volume bonus: a chance-heavy game is open and entertaining even when
     # finishing is poor (a 37-shot 0-0 isn't the same as a quiet one). Total shots
@@ -82,7 +88,7 @@ def calculate_excitement(home_goals, away_goals,
         dom_pen      = 0.0
 
     raw = (base + goal_bonus + close_bonus + sot_bonus + drama_bonus + volume_bonus
-           - dom_pen - margin_pen)
+           - dom_pen - margin_pen - low_sot_pen)
     score = round(_soft_cap(max(0.0, raw)), 2)
 
     return score, {
@@ -92,6 +98,7 @@ def calculate_excitement(home_goals, away_goals,
         "close_bonus": round(close_bonus, 2),
         "margin_pen":  round(margin_pen,  2),
         "sot_bonus":    sot_bonus,
+        "low_sot_pen":  low_sot_pen,
         "dom_pen":      dom_pen,
         "volume_bonus": volume_bonus,
         "drama_bonus":  drama_bonus,
@@ -263,6 +270,7 @@ def parse_events(events, summaries):
             "Home":   home.get("team", {}).get("displayName", ""),
             "Score":  score_display,
             "Away":   away.get("team", {}).get("displayName", ""),
+            "SOT":    None,
             "Excitement": None,
             "Verdict": "—",
         }
@@ -287,7 +295,11 @@ def parse_events(events, summaries):
                 late_goals=drama.get("late_goals", 0),
             )
             components_store[mid] = comps
-            row.update({"Excitement": score, "Verdict": get_verdict(score)})
+            row.update({
+                "SOT":        comps["total_sot"] if comps["has_sot"] else None,
+                "Excitement": score,
+                "Verdict":    get_verdict(score),
+            })
 
         rows.append(row)
 
@@ -374,7 +386,7 @@ if team_search.strip():
 view = view.reset_index(drop=True)
 
 # ── Table + Detail panel ──────────────────────────────────────────────────────
-DISPLAY_COLS = ["Round", "Date", "Home", "Score", "Away", "Excitement", "Verdict"]
+DISPLAY_COLS = ["Round", "Date", "Home", "Score", "Away", "SOT", "Excitement", "Verdict"]
 
 col_table, col_detail = st.columns([3, 2])
 
@@ -384,7 +396,12 @@ with col_table:
         selection_mode="single-row",
         on_select="rerun",
         column_config={
-            "Excitement": st.column_config.NumberColumn("Excitement ⭐", format="%.1f"),
+            "SOT": st.column_config.NumberColumn(
+                "SOT",
+                format="%d",
+                help="Total shots on target (both teams). Sortable — click a row for the full breakdown.",
+            ),
+            "Excitement": st.column_config.NumberColumn("Excitement ⭐", format="%.2f"),
         },
         hide_index=True,
         use_container_width=True,
@@ -459,6 +476,12 @@ with col_detail:
                     lines.append(
                         f"- **Shot Activity ({comps['total_sot']} on target · "
                         f"{comps['home_sot']} vs {comps['away_sot']}):** +{comps['sot_bonus']:.2f} pts"
+                    )
+
+                if comps.get("low_sot_pen", 0) > 0:
+                    lines.append(
+                        f"- **Low Shot Activity Penalty ({comps['total_sot']} on target · "
+                        f"below the 6 baseline):** -{comps['low_sot_pen']:.2f} pts"
                     )
 
                 if comps.get("volume_bonus", 0) > 0:
